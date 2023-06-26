@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 from functools import lru_cache
+from pathlib import Path
 from urllib.parse import quote
 
 from markdown import Markdown
@@ -155,3 +156,56 @@ class raise_if_debug:
 
         # suppress the exception
         return True
+
+
+from zipfile import ZipFile
+from os.path import isfile, join, splitext
+
+
+def archive_list_files(archive_file, settings):
+    ext = splitext(archive_file)[1].lower()
+    path = join(settings["source"], archive_file)
+
+    if ext == ".zip" or ext == ".cbz":
+        with ZipFile(path) as myzip:
+            return myzip.namelist()
+
+    return []
+
+
+def archive_extract_files(archive_file, dest, members, settings):
+    ext = splitext(archive_file)[1].lower()
+    path = join(settings["source"], archive_file)
+
+    if ext == ".zip" or ext == ".cbz":
+        with ZipFile(path) as myzip:
+            return myzip.extractall(dest, members)
+
+
+def flatten_dir(path):
+    """Given a dir, move all files from sub dirs to root level"""
+    for (
+        root,
+        d,
+        files,
+    ) in os.walk(path):
+        if root == path:
+            # Nothing to do on root
+            continue
+        for f in files:
+            fp = Path(path, f)
+            try:
+                fp.rename(path)
+            except OSError:
+                # FIXME - does not handle duplicates
+
+                pass
+
+    # FIXME: Clean up empty dirs after flatten
+
+    filenames = None
+    for root, dirs, fn_ in os.walk(path):
+        if root == path:
+            filenames = fn_
+            break
+    return filenames

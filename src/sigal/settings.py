@@ -93,6 +93,12 @@ _DEFAULT_CONFIG = {
     "write_html": True,
     "zip_gallery": False,
     "zip_media_format": "resized",
+    # Archive-as-album support
+    "archive_extensions": [
+        ".zip",
+        ".cbz",
+        # ".rar", ".cbr",
+    ],
 }
 
 

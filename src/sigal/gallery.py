@@ -55,6 +55,9 @@ from .utils import (
     is_valid_html5_video,
     read_markdown,
     url_from_path,
+    archive_list_files,
+    archive_extract_files,
+    flatten_dir,
 )
 from .video import process_video
 from .writer import AlbumListPageWriter, AlbumPageWriter
@@ -370,6 +373,7 @@ class Album:
         self.subdirs = dirnames
         self.output_file = settings["output_filename"]
         self._thumbnail = None
+        self.archive_type = None
 
         if path == ".":
             self.src_path = settings["source"]
@@ -393,13 +397,22 @@ class Album:
         #: :class:`~sigal.gallery.Video`).
         self.medias = medias = []
         self.medias_count = defaultdict(int)
+        self._raw_media_paths = []
 
         for f in filenames:
             ext = splitext(f)[1]
             media = None
             if ext.lower() in settings["img_extensions"]:
+                self.logger.debug("Found image %s in %s", f, self.path)
                 media = Image(f, self.path, settings)
+                self.logger.debug(
+                    "dst_path %s thumb_path %s path %s",
+                    media.dst_path,
+                    media.thumb_path,
+                    media.path,
+                )
             elif ext.lower() in settings["video_extensions"]:
+                self.logger.debug("Found video %s in %s", f, self.path)
                 media = Video(f, self.path, settings)
 
             # Allow modification of the media, including overriding the class
@@ -412,8 +425,11 @@ class Album:
             if media:
                 self.medias_count[media.type] += 1
                 medias.append(media)
+                # For archive extraction
+                self._raw_media_paths.append(f)
 
         signals.album_initialized.send(self)
+        self.logger.debug("%s media %s", self.name, self.medias)
 
     def __repr__(self):
         return "<{}>(path={!r}, title={!r})".format(
@@ -475,6 +491,7 @@ class Album:
         if self.medias:
             check_or_create_dir(join(self.dst_path, self.settings["thumb_dir"]))
 
+        # When dealing with archive, always create orig_path
         if self.medias and self.settings["keep_orig"]:
             self.orig_path = join(self.dst_path, self.settings["orig_dir"])
             check_or_create_dir(self.orig_path)
@@ -645,7 +662,12 @@ class Album:
 
             # use the thumbnail of their sub-directories
             if not self._thumbnail:
+                self.logger.debug(
+                    "No usable thumbnail within %r, check sub albums", self
+                )
                 for path, album in self.gallery.get_albums(self.path):
+                    self.logger.debug("sub-album: %s, %r", path, album)
+
                     if album.thumbnail:
                         self._thumbnail = url_quote(self.name) + "/" + album.thumbnail
                         self.logger.debug(
@@ -681,6 +703,7 @@ class Album:
                 break
 
             url = url_from_path(os.path.relpath(path, self.path)) + "/" + self.url_ext
+            self.logger.debug("Breadcrumb path: %s", path)
             breadcrumb.append((url, self.gallery.albums[path].title))
 
         breadcrumb.reverse()
@@ -696,6 +719,62 @@ class Album:
         """Placeholder ZIP method.
         The ZIP logic is controlled by the zip_gallery plugin
         """
+
+
+class ArchiveAlbum(Album):
+    """Archive-as-Album
+
+    Media files in an archive (e.g. zip file) are extracted and flattended into
+    a single Album
+
+    MVP version - Does not support description_file
+    """
+
+    def __init__(self, path, settings, gallery):
+        # Steps to init archive album - zip/rar/cbz/cbr/etc...
+        # 1. Scan for media in archive by listing all files within
+        # 2. If there's at least one media, extract the media files to the `orig_path` in the destination
+        #   - Do not extract to source - May not be writable
+        # 3. Flatten subdirs within the extracted files. Albums has to be flat
+        # 4. Initialise the album with orig_path supplied as the Album's path
+        # 5. Optional - Clean up original files if not keeping origs
+        files_in_archive = archive_list_files(path, settings)
+        files_to_extract = []
+        self.logger = logging.getLogger(__name__)
+
+        for f in files_in_archive:
+            ext = splitext(f)[1].lower()
+            if ext in settings["img_extensions"]:
+                files_to_extract.append(f)
+            elif ext in settings["video_extensions"]:
+                files_to_extract.append(f)
+        self.logger.debug(
+            "Found %d media files in archive: %s", len(files_to_extract), path
+        )
+
+        if len(files_to_extract) > 0:
+            orig_path = join(settings["destination"], path, settings["orig_dir"])
+            check_or_create_dir(orig_path)
+            self.logger.debug("Created original path: %s", orig_path)
+            archive_extract_files(path, orig_path, files_to_extract, settings)
+
+            filenames = flatten_dir(orig_path)
+            self.logger.debug("Media files in original path: %s", filenames)
+
+            super().__init__(orig_path, settings, [], filenames, gallery)
+
+            self.src_path = orig_path
+            self.dst_path = join(settings["destination"], path)
+            self.path = path
+            self.name = self.path.split(os.path.sep)[-1]
+
+            self.logger.debug("Media files in original path: %s", filenames)
+
+            # 6. Patch paths of medias
+            for media in self.medias:
+                media.path = self.path
+
+        # self.logger.debug("My thumbnail is: %s", self.thumbnail)
 
 
 class Gallery:
@@ -754,13 +833,32 @@ class Gallery:
                 if path not in albums.keys():
                     dirs.remove(d)
 
+            self.logger.debug("Album dirs: %s", dirs)
             album = Album(relpath, settings, dirs, files, self)
 
+            skipped = False
             if not album.medias and not album.albums:
                 self.logger.info("Skip empty album: %r", album)
+                skipped = True
             else:
                 album.create_output_directories()
                 albums[relpath] = album
+
+            # Check for archive files (e.g. .zip) in the current directory
+            for f in files:
+                ext = splitext(f)[1]
+                if ext.lower() in settings["archive_extensions"]:
+                    archive_album = ArchiveAlbum(join(relpath, f), settings, self)
+                    if not archive_album.medias and not archive_album.albums:
+                        self.logger.info("Skip empty archive album: %r", album)
+                    else:
+                        archive_album.create_output_directories()
+                        relpath_archive = join(relpath, f)
+                        albums[relpath_archive] = archive_album
+                        # Create the parent album, too
+                        albums[relpath] = album
+                        if skipped:
+                            album.subdirs.append(f)
 
         if show_progress:
             print("\rCollecting albums, done.")
@@ -781,7 +879,8 @@ class Gallery:
             for album in progress_albums:
                 album.sort_medias(settings["medias_sort_attr"])
 
-        self.logger.debug("Albums:\n%r", albums.values())
+        for k, v in albums.items():
+            self.logger.debug("Album %s => %r", k, v)
         signals.gallery_initialized.send(self)
 
     @property
